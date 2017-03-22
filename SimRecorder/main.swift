@@ -4,10 +4,10 @@ import CoreGraphics
 import OptionKit
 
 extension NSImage {
-    var CGImage: CGImageRef {
+    var CGImage: CGImage {
         get {
-            let imageData = self.TIFFRepresentation
-            let source = CGImageSourceCreateWithData(imageData!, nil)
+            let imageData = self.tiffRepresentation
+            let source = CGImageSourceCreateWithData(imageData! as CFData, nil)
             let maskRef = CGImageSourceCreateImageAtIndex(source!, 0, nil)!
             return maskRef;
         }
@@ -37,21 +37,27 @@ enum TargetSimulator: String {
 }
 
 class Storage {
-    private let DefaultTempDirName = "simrec"
-    private var url : NSURL?
+    fileprivate let DefaultTempDirName = "simrec/"
+    fileprivate var url : URL?
     
     init() {
         self.url = createTemporaryDirectory()
     }
     
-    func createTemporaryDirectory() -> NSURL? {
-        let url : NSURL = NSURL(fileURLWithPath: NSTemporaryDirectory())
-        let pathURL : NSURL = url.URLByAppendingPathComponent(DefaultTempDirName)
-        let fileManager = NSFileManager.defaultManager()
+    func createTemporaryDirectory() -> URL? {
+        let url : URL = URL(fileURLWithPath: NSTemporaryDirectory())
+        let pathURL : URL = url.appendingPathComponent(DefaultTempDirName)
+        let fileManager = FileManager.default
+        print("temporary directory: \(pathURL)")
         do {
-            try fileManager.createDirectoryAtURL(pathURL, withIntermediateDirectories: true, attributes: nil)
+            if fileManager.fileExists(atPath: pathURL.standardizedFileURL.path) {
+                print("path existed -> Remove")
+                try fileManager.removeItem(at: pathURL)
+            }
+            try fileManager.createDirectory(at: pathURL, withIntermediateDirectories: true, attributes: nil)
             return pathURL
         } catch {
+            print("Error when creating temporary folder \(error)")
             return nil
         }
     }
@@ -60,12 +66,24 @@ class Storage {
         return self.url?.absoluteString;
     }
     
-    func writeToFile(image : CGImageRef, filename : String) -> NSData {
-        let bitmapRep : NSBitmapImageRep = NSBitmapImageRep(CGImage: image)
-        let fileURL : NSURL = NSURL(string: filename, relativeToURL: self.url)!
-        let properties = Dictionary<String, AnyObject>()
-        let data : NSData = bitmapRep.representationUsingType(NSBitmapImageFileType.NSPNGFileType, properties: properties)!
-        if !data.writeToFile(fileURL.path!, atomically: false) {
+    func imageURLs(count: UInt) -> [URL] {
+        guard let url = url else { return [] }
+        var urls = [URL]()
+        for i in 0..<count {
+            urls.append(URL(string: "\(i).png", relativeTo: url)!)
+        }
+        
+        return urls
+    }
+    
+    func writeToFile(_ image : CGImage, filename : String) -> Data {
+        let bitmapRep : NSBitmapImageRep = NSBitmapImageRep(cgImage: image)
+        let fileURL : URL = URL(string: filename, relativeTo: url)!
+        let properties: Dictionary<String, AnyObject> = [
+            NSImageCompressionFactor: 0.5 as AnyObject,
+        ]
+        let data : Data = bitmapRep.representation(using: NSBitmapImageFileType.JPEG, properties: properties)!
+        if !((try? data.write(to: fileURL.standardizedFileURL, options: [])) != nil) {
             print("write to file failed")
         }
         return data
@@ -73,31 +91,32 @@ class Storage {
 }
 
 class Converter {
-    typealias ConvertFinishedCallback = (data: NSData?, succeed: Bool) -> ()
+    typealias ConvertFinishedCallback = (_ data: Data?, _ succeed: Bool) -> ()
     
-    func createGIF(with images: [NSImage], quality: Float = 1.0, loopCount: UInt = 0, frameDelay: Double, destinationURL : NSURL, callback : ConvertFinishedCallback?) {
+    func createGIF(with images: [NSImage], quality: Float = 1.0, loopCount: UInt = 0, frameDelay: Double, destinationURL : URL, callback : ConvertFinishedCallback?) {
         let frameCount = images.count
         let animationProperties = 
         [kCGImagePropertyGIFDictionary as String: [kCGImagePropertyGIFLoopCount as String: loopCount], 
-            kCGImageDestinationLossyCompressionQuality as String: quality]
+            kCGImageDestinationLossyCompressionQuality as String: quality] as [String : Any]
         let frameProperties = [kCGImagePropertyGIFDictionary as String: [kCGImagePropertyGIFDelayTime as String: frameDelay, kCGImagePropertyGIFUnclampedDelayTime as String: frameDelay]]
         
-        let destination = CGImageDestinationCreateWithURL(destinationURL, kUTTypeGIF, frameCount, nil)
+        let destination = CGImageDestinationCreateWithURL(destinationURL as CFURL, kUTTypeGIF, frameCount, nil)
         if let destination = destination {
-            CGImageDestinationSetProperties(destination, animationProperties)
-            for var i = 0; i < frameCount; ++i {
+            CGImageDestinationSetProperties(destination, animationProperties as CFDictionary?)
+            for i in 0 ..< frameCount {
                 autoreleasepool {
                     let image = images[i];
-                    CGImageDestinationAddImage(destination, image.CGImage, frameProperties)
+                    CGImageDestinationAddImage(destination, image.CGImage, frameProperties as CFDictionary?)
                 }
             }
+
             if CGImageDestinationFinalize(destination) {
                 if let callback = callback {
-                    callback(data: NSData(contentsOfURL: destinationURL), succeed: true)
+                    callback(try? Data(contentsOf: destinationURL), true)
                 }
             } else {
                 if let callback = callback {
-                    callback(data: nil, succeed: false)
+                    callback(nil, false)
                 }
             }
         }
@@ -105,15 +124,17 @@ class Converter {
 }
 
 class Recorder {
-    private var windowID : CGWindowID?
-    private var frame: UInt = 0
-    private var timer: NSTimer!
-    private let storage: Storage = Storage()
-    private let converter: Converter = Converter()
-    private var images: [NSImage] = []
-    var quality: Float = 1.0
-    var fps: UInt = 5
-    var outputPath: String = "animation.gif"
+    fileprivate var windowID : CGWindowID?
+    fileprivate var frame: UInt = 0
+    fileprivate var timer: Timer!
+    fileprivate let storage: Storage = Storage()
+    fileprivate let converter: Converter = Converter()
+    fileprivate let movieWriter = MovieWriter()
+//    fileprivate var images: [NSImage] = []
+    var quality: Float = 0.5
+    var sizeScale: Float = 0.5
+    var fps: UInt = 10
+    var outputPath: String = "animation.mov"
     var loopCount: UInt = 0
     var targetSimulator: TargetSimulator
     
@@ -126,17 +147,17 @@ class Recorder {
         self.windowID = self.simulatorWindowID()
     }
 
-    private func simulatorWindowID() -> CGWindowID? {
+    fileprivate func simulatorWindowID() -> CGWindowID? {
         var windowIDs : [CGWindowID] = []
         
         let simulators : [NSRunningApplication]
         if targetSimulator.hasBundleId() {
-            simulators = NSWorkspace.sharedWorkspace().runningApplications.filter({
+            simulators = NSWorkspace.shared().runningApplications.filter({
                 (app : NSRunningApplication) in
                 return app.bundleIdentifier == targetSimulator.toFilterValue()
             })
         } else {
-            simulators = NSWorkspace.sharedWorkspace().runningApplications.filter({
+            simulators = NSWorkspace.shared().runningApplications.filter({
                 (app : NSRunningApplication) in
                 return app.localizedName == targetSimulator.toFilterValue()
             })
@@ -145,14 +166,14 @@ class Recorder {
         if (simulators.count > 0) {
             let simulator : NSRunningApplication = simulators.first!
             
-            let windowArray : CFArrayRef = CGWindowListCopyWindowInfo(CGWindowListOption.OptionOnScreenOnly, 0)!
+            let windowArray : CFArray = CGWindowListCopyWindowInfo(CGWindowListOption.optionOnScreenOnly, 0)!
             let windows : NSArray = windowArray as NSArray
             for window in windows {
                 let dict = window as! Dictionary<String, AnyObject>
                 let windowIDNumber: NSNumber = dict["kCGWindowNumber"] as! NSNumber
                 let ownerPID: NSNumber = dict["kCGWindowOwnerPID"] as! NSNumber
-                if ownerPID.intValue == Int32(simulator.processIdentifier) {
-                    windowIDs.append(CGWindowID(windowIDNumber.intValue))
+                if ownerPID.int32Value == Int32(simulator.processIdentifier) {
+                    windowIDs.append(CGWindowID(windowIDNumber.int32Value))
                 }
             }
         }
@@ -166,63 +187,70 @@ class Recorder {
         return 1.0 / Double(self.fps)
     }
     
-    func outputURL() -> NSURL {
-        return NSURL(string: self.outputPath)!
+    func outputURL() -> URL {
+        return URL(string: self.outputPath)!
     }
     
     func isAttachSimulator() -> Bool {
         return self.windowID != nil
     }
 
-    @objc private func takeScreenshot() {
-        let imageRef : CGImageRef = CGWindowListCreateImage(CGRectNull, CGWindowListOption.OptionIncludingWindow, windowID!, CGWindowImageOption.BoundsIgnoreFraming)!
+    @objc fileprivate func takeScreenshot() {
+        let imageRef : CGImage = CGWindowListCreateImage(CGRect.null, CGWindowListOption.optionIncludingWindow, windowID!, CGWindowImageOption.boundsIgnoreFraming)!
         let newRef = removeAlpha(imageRef)
-        let data : NSData = self.storage.writeToFile(newRef, filename: "\(self.frame).png")
-        ++self.frame
-        let image = NSImage(data: data)
-        if let image = image {
-            self.images.append(image)
-        }
+        _ = self.storage.writeToFile(newRef, filename: "\(self.frame).png")
+        self.frame += 1
+//        let image = NSImage(data: data)
+//        if let image = image {
+//            self.images.append(image)
+//        }
     }
     
-    private func removeAlpha(imageRef: CGImageRef) -> CGImageRef {
-        let width = CGImageGetWidth(imageRef)
-        let height = CGImageGetHeight(imageRef)
-        let bitmapContext: CGContextRef? = CGBitmapContextCreate(nil,
-            width,
-            height,
-            CGImageGetBitsPerComponent(imageRef), 
-            CGImageGetBytesPerRow(imageRef), 
-            CGImageGetColorSpace(imageRef), 
-            CGImageAlphaInfo.NoneSkipLast.rawValue | CGBitmapInfo.ByteOrder32Little.rawValue)
-        let rect: CGRect = CGRectMake(0, 0, CGFloat(width), CGFloat(height))
+    fileprivate func removeAlpha(_ imageRef: CGImage) -> CGImage {
+        let width = imageRef.width
+        let height = imageRef.height
+        let bitmapContext: CGContext? = CGContext(data: nil,
+            width: width,
+            height: height,
+            bitsPerComponent: imageRef.bitsPerComponent, 
+            bytesPerRow: imageRef.bytesPerRow, 
+            space: imageRef.colorSpace!, 
+            bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue | CGBitmapInfo.byteOrder32Little.rawValue)
+        let rect: CGRect = CGRect(x: 0, y: 0, width: CGFloat(width), height: CGFloat(height))
         if let bitmapContext = bitmapContext {
-            CGContextDrawImage(bitmapContext, rect, imageRef);
-            return CGBitmapContextCreateImage(bitmapContext)!
+            bitmapContext.draw(imageRef, in: rect);
+            return bitmapContext.makeImage()!
         }
         return imageRef
     }
     
     func startCapture() {
-        self.timer = NSTimer.scheduledTimerWithTimeInterval(self.secPerFrame(), target: self, selector: "takeScreenshot", userInfo: nil, repeats: true)
+        self.timer = Timer.scheduledTimer(timeInterval: self.secPerFrame(), target: self, selector: #selector(Recorder.takeScreenshot), userInfo: nil, repeats: true)
     }
     
-    func endCapture(callback : Converter.ConvertFinishedCallback?) {
+    func endCapture(_ callback : Converter.ConvertFinishedCallback?) {
         self.timer?.invalidate()
-        let destinationURL : NSURL = NSURL(fileURLWithPath: self.outputPath)
-        self.converter.createGIF(with: self.images, quality: self.quality, loopCount: self.loopCount, frameDelay: self.secPerFrame(), destinationURL: destinationURL, callback: callback)
+        let destinationURL : URL = URL(fileURLWithPath: self.outputPath)
+        self.movieWriter.writeImagesAsMovie(
+            imageURLs: self.storage.imageURLs(count: frame),
+            videoPath: destinationURL.standardizedFileURL.path,
+            scale: CGFloat(sizeScale),
+            videoFPS: Int32(fps),
+            compressionQuality: CGFloat(quality),
+            callback: callback)
+//        self.converter.createGIF(with: self.images, quality: self.quality, loopCount: self.loopCount, frameDelay: self.secPerFrame(), destinationURL: destinationURL, callback: callback)
     }
 }
 
 class Command {
     typealias SignalCallback = @convention(c) (Int32) -> Void
 
-    static func execute(arguments : [String]) {
-        let frameRateOption = Option(trigger: OptionTrigger.Mixed("f", "fps"), numberOfParameters: 1, helpDescription: "Recording frames per second")
-        let outputPathOption = Option(trigger: OptionTrigger.Mixed("o", "outputPath"), numberOfParameters: 1, helpDescription: "Animation output path")
-        let qualityOption = Option(trigger: OptionTrigger.Mixed("q", "quality"), numberOfParameters: 1, helpDescription: "Quality of animations 0.0 ~ 1.0")
-        let loopCountOption = Option(trigger: OptionTrigger.Mixed("l", "loopCount"), numberOfParameters: 1, helpDescription: "Loop count of animations. if you passed 0, it animate eternally")
-        let targetSimulatorOption = Option(trigger: OptionTrigger.Mixed("t", "targetSimulator"), numberOfParameters: 1, helpDescription: "Target simulator [\(TargetSimulator.iOS.rawValue)|\(TargetSimulator.Android64ARM.rawValue)|\(TargetSimulator.Android64X86.rawValue)|\(TargetSimulator.Android64MIPS.rawValue)]")
+    static func execute(_ arguments : [String]) {
+        let frameRateOption = Option(trigger: OptionTrigger.mixed("f", "fps"), numberOfParameters: 1, helpDescription: "Recording frames per second")
+        let outputPathOption = Option(trigger: OptionTrigger.mixed("o", "outputPath"), numberOfParameters: 1, helpDescription: "Animation output path")
+        let qualityOption = Option(trigger: OptionTrigger.mixed("q", "quality"), numberOfParameters: 1, helpDescription: "Quality of animations 0.0 ~ 1.0")
+        let loopCountOption = Option(trigger: OptionTrigger.mixed("l", "loopCount"), numberOfParameters: 1, helpDescription: "Loop count of animations. if you passed 0, it animate eternally")
+        let targetSimulatorOption = Option(trigger: OptionTrigger.mixed("t", "targetSimulator"), numberOfParameters: 1, helpDescription: "Target simulator [\(TargetSimulator.iOS.rawValue)|\(TargetSimulator.Android64ARM.rawValue)|\(TargetSimulator.Android64X86.rawValue)|\(TargetSimulator.Android64MIPS.rawValue)]")
         
         let parser = OptionParser(definitions: [frameRateOption, outputPathOption, qualityOption, loopCountOption, targetSimulatorOption])
         
@@ -263,7 +291,7 @@ class Command {
             }
             
             let callback : @convention(block) (Int32) -> Void = { (Int32) -> Void in
-                recorder.endCapture({ (data : NSData?, succeed : Bool) in
+                recorder.endCapture({ (data : Data?, succeed : Bool) in
                     if succeed {
                         print("Gif animation generated")
                         exit(EXIT_SUCCESS)
@@ -275,18 +303,18 @@ class Command {
             }
             
             // Convert Objective-C block to C function pointer
-            let imp = imp_implementationWithBlock(unsafeBitCast(callback, AnyObject.self))
-            signal(SIGINT, unsafeBitCast(imp, SignalCallback.self))
+            let imp = imp_implementationWithBlock(unsafeBitCast(callback, to: AnyObject.self))
+            signal(SIGINT, unsafeBitCast(imp, to: SignalCallback.self))
             recorder.startCapture()
             autoreleasepool {
-                NSRunLoop.currentRunLoop().run()
+                RunLoop.current.run()
             }
         } catch {
         }
     }
 }
 
-let actualArguments = Array(Process.arguments[1..<Process.arguments.count])
+let actualArguments = Array(CommandLine.arguments[1..<CommandLine.arguments.count])
 
 Command.execute(actualArguments)
 
